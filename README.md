@@ -1,498 +1,196 @@
-# Agent MCP Server with LangGraph
+# MCP Log Agent
 
-A company-support AI agent built using **LangGraph**, **FastMCP**, and the **Model Context Protocol (MCP)**.
+A company-support AI agent built with **LangGraph**, **FastMCP**, and the **Model Context Protocol (MCP)**.
 
-The project demonstrates how an LLM-powered LangGraph agent can connect to an MCP server, discover available tools, and use those tools to answer company-policy questions and investigate technical issues using application log files.
+A LangGraph agent connects to an MCP server, discovers its tools at runtime, and uses them to answer company-policy questions and to diagnose technical problems by searching application logs. The MCP server can be containerized with Docker and deployed to a local Kubernetes cluster with Helm.
 
-The MCP server can also be containerized using Docker and deployed to a local Kubernetes cluster using Helm.
+## Features
 
----
+- **Tool discovery over MCP:** the agent loads tools from the server at startup instead of hardcoding them.
+- **LangGraph reasoning loop:** the agent can call a tool, read the result, and call another tool before answering.
+- **Two workflows:** company-policy lookup and log-based troubleshooting.
+- **Structured diagnoses:** technical answers always follow a `Hypothesis / Evidence / Suggested next step` format.
+- **Loop protection:** after 5 tool results the agent is forced to produce a final answer without further tool calls.
+- **Deployable:** includes a Dockerfile and a Helm chart (Deployment + NodePort Service).
 
 ## Architecture
 
-```text
-                         User
-                           |
-                           v
-                   +---------------+
-                   |   LangGraph   |
-                   |     Agent     |
-                   |   agent.py    |
-                   +-------+-------+
-                           |
-                           | MCP
-                           | Streamable HTTP
-                           v
-                   +---------------+
-                   | FastMCP Server|
-                   |   server.py   |
-                   +-------+-------+
-                           |
-              +------------+------------+
-              |                         |
-              v                         v
-       Company Rules                 Log Files
-       data/rules.txt                   |
-                                  +------+------+
-                                  |      |      |
-                               auth   database payment
-                               .log     .log     .log
+```mermaid
+flowchart TD
+    U[User] --> A[LangGraph Agent<br/>agent.py]
+    A -- "MCP over streamable HTTP" --> S[FastMCP Server<br/>server.py]
+    S --> R[data/rules.txt]
+    S --> L[logs/*.log]
 ```
 
-The LangGraph workflow is:
+### Agent graph
 
-```text
-START
-  |
-  v
-AGENT ---------> END
-  |
-  | Tool Call
-  v
-TOOLS
-  |
-  +-------------> AGENT
+![LangGraph agent graph](langgraph.png)
+
+```mermaid
+flowchart LR
+    START --> agent
+    agent -- "tool call" --> tools
+    tools --> agent
+    agent -- "no tool call" --> END
 ```
 
-The agent decides whether a tool is required. If the LLM generates a tool call, LangGraph routes execution to the `tools` node. After the tool result is returned, execution goes back to the `agent` node so the LLM can reason over the result and either call another tool or generate the final answer.
+The `agent` node asks the LLM what to do next. If the LLM requests a tool, `tools_condition` routes execution to the `tools` node (LangGraph's `ToolNode`), which runs the MCP tool and returns the result to the `agent` node. This repeats until the LLM answers without requesting a tool.
 
----
+## MCP tools
 
-## Project Structure
+| Tool | Arguments | Description |
+|---|---|---|
+| `get_company_rules` | none | Returns the contents of `data/rules.txt` (working hours, leave, refunds, expenses, IT policy). |
+| `get_log_file_names` | none | Lists the `.log` / `.txt` files in `logs/`, each with its first line as a preview. |
+| `search_log` | `file_name`, `keyword`, `limit` (default 20) | Case-insensitive substring search in one log file. Returns matching lines **newest first** with their line numbers. |
 
-```text
-agent-project/
-│
-├── data/
-│   └── rules.txt
-│
-├── helm/
-│   ├── templates/
-│   │   ├── deployment.yaml
-│   │   └── service.yaml
-│   │
-│   ├── Chart.yaml
-│   └── values.yaml
-│
-├── logs/
-│   ├── auth.log
-│   ├── database.log
-│   └── payment.log
-│
-├── .env
-├── .gitignore
-├── .python-version
-├── agent.py
-├── langgraph.png
-├── pyproject.toml
-├── README.md
-├── requirements.txt
-└── server.py
-```
+`search_log` strips any directory components from `file_name`, so only files directly inside `logs/` can be read.
 
----
+## Agent workflows
 
-# Components
+**Company policy questions** (e.g. *"What are the working hours?"*)
 
-## 1. MCP Server
+1. The agent calls `get_company_rules`.
+2. It answers only from the returned text. If the answer isn't there, it says: *"I could not find this information in the company rules."*
 
-The MCP server is implemented in:
+**Technical problems** (e.g. *"Why are my payments failing?"*)
 
-```text
-server.py
-```
-
-The server uses **FastMCP** and exposes tools over HTTP.
-
-The server runs on:
-
-```text
-0.0.0.0:5000
-```
-
-with the MCP endpoint:
-
-```text
-/mcp
-```
-
-When running locally, the endpoint is therefore:
-
-```text
-http://localhost:5000/mcp
-```
-
----
-
-## MCP Tools
-
-The MCP server currently exposes three tools.
-
-### `get_company_rules`
-
-Reads company policies and rules from:
-
-```text
-data/rules.txt
-```
-
-This tool is intended for questions related to company information such as:
-
-- Working hours
-- Leave policies
-- Refund policies
-- Expense policies
-- IT policies
-- Other company rules
-
-Example question:
-
-```text
-What are the working hours of the company?
-```
-
-The agent calls:
-
-```text
-get_company_rules()
-```
-
-and generates the answer using the information returned by the tool.
-
----
-
-### `get_log_file_names`
-
-Lists the available log files.
-
-The current project contains:
-
-```text
-logs/
-├── auth.log
-├── database.log
-└── payment.log
-```
-
-The tool also returns the first line of each file as a preview.
-
-This gives the LLM information about the available logs so the agent can determine which log file is most relevant to a user's technical problem.
-
----
-
-### `search_log`
-
-Searches a specified log file for a keyword.
-
-The tool accepts:
-
-```text
-file_name
-keyword
-limit
-```
-
-For example:
-
-```text
-file_name = payment.log
-keyword   = failed
-limit     = 20
-```
-
-The search is case-insensitive and matching log entries are returned from newest to oldest.
-
----
-
-# 2. LangGraph Agent
-
-The LangGraph agent is implemented in:
-
-```text
-agent.py
-```
-
-The agent connects to the MCP server using an MCP client and retrieves the tools exposed by the server.
-
-The tools are then made available to the LLM.
-
-The main LangGraph contains two nodes:
-
-```text
-agent
-tools
-```
-
-The graph flow is:
-
-```text
-START
-  |
-  v
-agent
-  |
-  | Tool required
-  v
-tools
-  |
-  v
-agent
-```
-
-If the LLM does not request a tool, the graph finishes:
-
-```text
-START
-  |
-  v
-agent
-  |
-  v
-END
-```
-
----
-
-## ToolNode
-
-LangGraph's `ToolNode` is responsible for executing tool calls generated by the LLM.
-
-The flow is conceptually:
-
-```text
-LLM
- |
- | requests tool
- v
-ToolNode
- |
- | executes MCP tool
- v
-Tool Result
- |
- v
-LLM
-```
-
-This allows the model to dynamically use MCP tools instead of having tool execution hardcoded into the application logic.
-
----
-
-## Tool Routing
-
-The application uses LangGraph's `tools_condition` to determine what should happen after the `agent` node.
-
-Conceptually:
-
-```text
-                  +---- Tool Call ----> tools
-                  |
-agent ------------+
-                  |
-                  +---- No Tool Call --> END
-```
-
-After a tool executes:
-
-```text
-tools --> agent
-```
-
-This allows multiple reasoning and tool-execution steps when required.
-
----
-
-# Agent Workflows
-
-## Company Policy Questions
-
-Example:
-
-```text
-What are the working hours of the company?
-```
-
-The intended flow is:
-
-```text
-User
- |
- v
-Agent
- |
- v
-get_company_rules()
- |
- v
-rules.txt
- |
- v
-Tool Result
- |
- v
-Agent
- |
- v
-Final Answer
-```
-
-The agent is instructed to answer company-policy questions using information returned by the MCP company-rules tool.
-
----
-
-## Technical Problem Investigation
-
-Example:
-
-```text
-Why are my payments failing?
-```
-
-The intended workflow is:
-
-```text
-User
- |
- v
-Agent
- |
- v
-get_log_file_names()
- |
- v
-Available Log Files
- |
- v
-Agent selects relevant file
- |
- v
-search_log()
- |
- v
-Matching Log Entries
- |
- v
-Agent
- |
- v
-Final Diagnosis
-```
-
-If the first search does not provide useful evidence, the agent can search again using another relevant keyword.
-
-Possible search keywords include:
-
-```text
-error
-failed
-failure
-timeout
-exception
-refused
-unavailable
-denied
-slow
-```
-
-For technical problems, the agent provides a response in the following structure:
+1. The agent calls `get_log_file_names` and picks the most relevant file.
+2. It calls `search_log` with one keyword (`error`, `failed`, `timeout`, `refused`, `denied`, ...).
+3. If the result is empty or unhelpful, it retries with a different keyword; it never repeats the same file and keyword pair.
+4. It replies in this format:
 
 ```text
 Hypothesis: <most likely cause>
 
-Evidence: <relevant evidence from the logs>
+Evidence: <relevant log entries>
 
 Suggested next step: <recommended action>
 ```
 
----
-
-# Requirements
-
-The project requires Python and the dependencies defined in:
+## Project structure
 
 ```text
-requirements.txt
+.
+├── agent.py            # LangGraph agent and interactive CLI
+├── server.py           # FastMCP server exposing the three tools
+├── requirements.txt
+├── Dockerfile
+├── .dockerignore
+├── langgraph.png       # Agent graph diagram
+└── helm/
+    ├── Chart.yaml
+    ├── values.yaml
+    └── templates/
+        ├── deployment.yaml
+        └── service.yaml
 ```
 
-Main dependencies include:
+These are **not** in the repository (they are git-ignored) and you must create them locally:
 
 ```text
-fastmcp
-langgraph
-langchain
-langchain-mcp-adapters
-langchain_openai
+├── data/
+│   └── rules.txt
+├── logs/
+│   ├── auth.log
+│   ├── database.log
+│   └── payment.log
+└── .env
 ```
 
-Install them using:
+## Getting started
+
+### Prerequisites
+
+- Python 3.12 (the Docker image uses 3.12)
+- An OpenAI-compatible chat endpoint whose model supports **tool calling**
+- Optional: Docker, `kubectl`, Helm, and a local Kubernetes cluster (Docker Desktop, minikube, or kind)
+
+### 1. Install
 
 ```bash
+git clone https://github.com/Binomial77/MCP-Log-agent.git
+cd MCP-Log-agent
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
----
+### 2. Create the data and log files
 
-# Environment Variables
+The server reads `data/rules.txt` and everything in `logs/`. Create them before starting the server (and before building the Docker image, because the image copies whatever is in the project folder).
 
-Create a `.env` file in the project root.
+```bash
+mkdir data logs
+```
 
-Example:
+`data/rules.txt` can be any plain text. For example:
+
+```text
+Working hours: Monday to Friday, 9:00 AM to 6:00 PM.
+Leave policy: 24 paid leave days per year.
+Refund policy: Refunds are processed within 7 business days.
+Expense policy: Claims must be submitted within 30 days with receipts.
+IT policy: Use company-issued devices and enable MFA.
+```
+
+Each log file is plain text with one entry per line. For example, `logs/payment.log`:
+
+```text
+2026-10-19 09:58:12 INFO  payment-service started
+2026-10-19 10:02:41 ERROR payment gateway timeout after 30s (order=8841)
+2026-10-19 10:02:42 WARN  retrying payment for order=8841
+2026-10-19 10:03:05 ERROR connection refused: gateway.internal:443
+```
+
+The first line of each file is used as its preview in `get_log_file_names`.
+
+### 3. Configure the LLM
+
+Create a `.env` file in the project root:
 
 ```env
-BROKER_URL=<your-model-broker-url>
+BROKER_URL=<your-openai-compatible-base-url>
 API_KEY=<your-api-key>
 MODEL_NAME=<your-model-name>
 ```
 
-The application uses:
+If `BROKER_URL` ends with `/chat/completions`, that suffix is stripped automatically. The agent exits with an error if any of the three variables is missing.
 
-```text
-BROKER_URL
-API_KEY
-MODEL_NAME
-```
-
-to configure the OpenAI-compatible LLM connection.
-
----
-
-# Running the MCP Server Locally
-
-Start the MCP server:
+### 4. Run the MCP server
 
 ```bash
 python server.py
 ```
 
-The server runs on:
+The server listens on `0.0.0.0:5000`; the MCP endpoint is `http://localhost:5000/mcp`.
 
-```text
-http://localhost:5000
+### 5. Run the agent
+
+The agent connects to **`http://localhost:30000/mcp`** (the Kubernetes NodePort, see below). If you run the server directly with `python server.py`, edit the `url` in `agent.py` to `http://localhost:5000/mcp`:
+
+```python
+client = MultiServerMCPClient(
+    {
+        "support": {
+            "url": "http://localhost:5000/mcp",
+            "transport": "streamable_http",
+        }
+    }
+)
 ```
 
-The MCP endpoint is:
-
-```text
-http://localhost:5000/mcp
-```
-
----
-
-# Running the LangGraph Agent
-
-Once an MCP server is available, run:
+Then start the agent:
 
 ```bash
 python agent.py
 ```
 
-The agent establishes a connection to the configured MCP server and discovers the available tools.
-
-Example output:
+Example session:
 
 ```text
 Connected to MCP server.
-
 Available tools:
   - get_company_rules
   - get_log_file_names
@@ -500,82 +198,95 @@ Available tools:
 
 Company Support Agent started.
 Type 'exit' to stop.
-```
 
-You can then ask questions:
-
-```text
-Ask: What are the working hours of the company?
-```
-
-Or technical questions:
-
-```text
 Ask: Why are payments failing?
+
+Tool execution history:
+  - get_log_file_names({})
+  - search_log({'file_name': 'payment.log', 'keyword': 'error'})
+
+Answer:
+Hypothesis: The payment gateway is timing out and refusing connections.
+Evidence: ...
+Suggested next step: ...
 ```
 
-To stop the application:
+Each question is answered independently; the agent does not keep conversation history between questions.
 
-```text
-exit
-```
+## Docker
 
----
-
-# Docker
-
-The MCP server can be packaged as a Docker image before deploying it to Kubernetes.
-
-Build the image from the project root:
+Build from the project root (after creating `data/` and `logs/`):
 
 ```bash
 docker build -t agent-mcp-server:latest .
+docker run --rm -p 5000:5000 agent-mcp-server:latest
 ```
 
-Verify that the image exists:
+To use your own logs without rebuilding, mount them:
 
 ```bash
-docker images
+docker run --rm -p 5000:5000 \
+  -v "$(pwd)/logs:/app/logs" -v "$(pwd)/data:/app/data" \
+  agent-mcp-server:latest
 ```
 
-The image should appear as:
+## Kubernetes with Helm
 
-```text
-agent-mcp-server   latest
+The chart in `helm/` deploys the server as a single-replica Deployment exposed through a NodePort Service.
+
+| Value | Default |
+|---|---|
+| `replicaCount` | `1` |
+| `image.repository` / `image.tag` | `agent-mcp-server` / `latest` |
+| `image.pullPolicy` | `Never` (the image must already exist in the cluster) |
+| `container.port` | `5000` |
+| `service.type` | `NodePort` |
+| `service.port` / `service.targetPort` / `service.nodePort` | `5000` / `5000` / `30000` |
+
+Because `pullPolicy` is `Never`, make the image available to your cluster first:
+
+```bash
+# Docker Desktop Kubernetes: nothing extra needed
+# minikube:
+minikube image load agent-mcp-server:latest
+# kind:
+kind load docker-image agent-mcp-server:latest
 ```
 
-The Kubernetes deployment uses this image.
+Install the chart:
 
----
-
-# Kubernetes Deployment with Helm
-
-The project contains a Helm chart under:
-
-```text
-helm/
+```bash
+helm install agent-mcp-server ./helm
+kubectl get pods
+kubectl get svc agent-mcp-service
 ```
 
-The chart contains:
+On Docker Desktop the endpoint is `http://localhost:30000/mcp`, which matches the default in `agent.py`. On minikube, use `minikube service agent-mcp-service --url` to get the address, or run `kubectl port-forward svc/agent-mcp-service 30000:5000`.
 
-```text
-helm/
-├── Chart.yaml
-├── values.yaml
-└── templates/
-    ├── deployment.yaml
-    └── service.yaml
+To update or remove the release:
+
+```bash
+helm upgrade agent-mcp-server ./helm
+helm uninstall agent-mcp-server
 ```
 
----
+## Troubleshooting
 
-# Chart.yaml
+| Symptom | Likely cause and fix |
+|---|---|
+| `FileNotFoundError` for `rules.txt` or the `logs` folder | `data/` and `logs/` are git-ignored. Create them (step 2). |
+| `BROKER_URL / API_KEY / MODEL_NAME is missing` | Create `.env` in the project root (step 3). |
+| Connection refused on `localhost:30000` | The server isn't deployed to Kubernetes. Run it locally and change the agent URL to port `5000`, or deploy with Helm. |
+| `ImagePullBackOff` / `ErrImageNeverPull` | The image isn't in the cluster. Load it with `minikube image load` or `kind load docker-image`. |
+| Agent never calls tools | The configured model doesn't support native tool calling. Use one that does. |
 
-`Chart.yaml` contains information about the Helm chart.
+## Limitations
 
-```yaml
-apiVersion: v2
+- Log search is a plain substring match; there is no regex, time filtering, or multi-file search.
+- Whole log files are read into memory, so very large logs will be slow.
+- The MCP endpoint has no authentication and binds to `0.0.0.0`. Don't expose it beyond a trusted network.
+- The agent has no memory across questions and stops after 5 tool results.
 
-name: agent-mcp-server
+## Tech stack
 
-description: Helm chart for deploying
+Python, LangGraph, LangChain, FastMCP, `langchain-mcp-adapters`, `langchain-openai`, Docker, Kubernetes, Helm.
