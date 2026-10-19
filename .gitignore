@@ -1,0 +1,9 @@
+.venv
+/data
+/logs
+.env
+.python-version
+pyproject.toml
+
+
+
